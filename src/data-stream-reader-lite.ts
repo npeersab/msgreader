@@ -1,5 +1,3 @@
-import { TextDecoder } from 'fast-text-encoding';
-
 export type TypedArray =
     | Int8Array
     | Uint8Array
@@ -26,7 +24,7 @@ export type TypedArray =
 export default class DataStreamReaderLite {
     private _byteOffset: number;
     position = 0;
-    private _buffer: ArrayBuffer;
+    private _buffer: ArrayBufferLike;
     private _dataView: DataView;
 
     constructor(
@@ -102,7 +100,7 @@ export default class DataStreamReaderLite {
      * The setter updates the DataView to point to the new buffer.
      * @type {Object}
      */
-    get buffer(): ArrayBuffer {
+    get buffer(): ArrayBufferLike {
         this._trimAlloc();
         return this._buffer;
     }
@@ -408,7 +406,7 @@ export default class DataStreamReaderLite {
      * @param {number} srcOffset Offset to the source ArrayBuffer.
      * @param {number} byteLength Number of bytes to copy.
      */
-    static memcpy(dst: ArrayBufferLike, dstOffset: number, src: ArrayBuffer, srcOffset: number, byteLength: number) {
+    static memcpy(dst: ArrayBufferLike, dstOffset: number, src: ArrayBufferLike, srcOffset: number, byteLength: number) {
         const dstU8 = new Uint8Array(dst, dstOffset, byteLength);
         const srcU8 = new Uint8Array(src, srcOffset, byteLength);
         dstU8.set(srcU8);
