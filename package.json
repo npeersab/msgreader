@@ -1,6 +1,6 @@
 {
   "name": "@npeersab/msgreader",
-  "version": "3.8.3",
+  "version": "3.9.8",
   "description": "",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -20,7 +20,7 @@
   },
   "homepage": "https://github.com/npeersab/msgreader#readme",
   "devDependencies": {
-    "typescript": "3.8.3"
+    "typescript": "3.9.8"
   },
   "dependencies": {
     "fast-text-encoding": "1.0.3"
