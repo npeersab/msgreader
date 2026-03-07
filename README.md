@@ -14,6 +14,7 @@ This repo contains the core of the original project as npm package.
 | 2.0.1 | es2015 |
 | 3.8.3 | es2015 |
 | 3.9.8 | es2015 |
+| 4.1.6 | ES2018 |
 
 ## How to use
 ```javascript
