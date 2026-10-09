@@ -1,25 +1,43 @@
 {
-  "name": "@npeersab/msgreader",
-  "version": "4.4.0",
-  "description": "",
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc",
-    "prepare": "npm run build"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/npeersab/msgreader.git"
-  },
-  "author": "@npeersab (Noor Peersab)",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/npeersab/msgreader/issues"
-  },
-  "homepage": "https://github.com/npeersab/msgreader#readme",
-  "devDependencies": {
-    "typescript": "4.4.4"
-  }
+    "name": "@npeersab/msgreader",
+    "version": "5.0.0",
+    "description": "Outlook .msg file reader: parse MSG metadata, recipients, RTF body and attachments in Node.js and browsers",
+    "license": "Apache-2.0",
+    "type": "commonjs",
+    "main": "lib/index.js",
+    "types": "lib/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./lib/index.d.ts",
+            "require": "./lib/index.js",
+            "import": "./lib/index.js",
+            "default": "./lib/index.js"
+        },
+        "./package.json": "./package.json"
+    },
+    "files": ["lib", "README.md", "LICENSE", "CHANGELOG.md"],
+    "keywords": ["msg", "outlook", "email", "ole", "cfb", "attachment", "parser", "rtf"],
+    "engines": {
+        "node": ">=16"
+    },
+    "scripts": {
+        "build": "npm run clean && tsc -p tsconfig.json",
+        "clean": "rm -rf lib",
+        "test": "npm run build && node --test tests/*.test.js",
+        "prepare": "npm run build",
+        "prepublishOnly": "npm run build"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/npeersab/msgreader.git"
+    },
+    "author": "@npeersab (Noor Peersab)",
+    "bugs": {
+        "url": "https://github.com/npeersab/msgreader/issues"
+    },
+    "homepage": "https://github.com/npeersab/msgreader#readme",
+    "devDependencies": {
+        "@types/node": "^22.7.4",
+        "typescript": "^5.6.3"
+    }
 }

@@ -16,9 +16,30 @@
  MSG Reader
  */
 
-import { arraysEqual } from './utils';
+import { arraysEqual, concatUint8Arrays, fileTimeToDate, stripTrailingNul } from './utils';
 import CONST from './const';
-import DataStream from './data-stream-reader-lite';
+import DataStream, { ByteSource } from './data-stream-reader-lite';
+import { decompressRtfToString } from './rtf';
+
+export type { ByteSource };
+
+/** Input accepted by the MsgReader constructor. */
+export type MsgBuffer = ByteSource;
+
+/** Thrown when the input is not a readable .msg (OLE compound document) file. */
+export class InvalidMsgFileError extends Error {
+    constructor(message = 'Unsupported file type! Input is not an Outlook .msg file.') {
+        super(message);
+        this.name = 'InvalidMsgFileError';
+    }
+}
+
+/** Guards against corrupt files that declare absurd stream sizes. */
+export const MAX_DOCUMENT_SIZE = 256 * 1024 * 1024;
+/** Max FAT chain links followed for a single stream. */
+const MAX_CHAIN_LENGTH = 300000;
+/** Max directory entries parsed from a single file. */
+const MAX_PROPERTIES = 200000;
 
 // MSG Reader implementation
 
@@ -33,33 +54,43 @@ function getBlockOffsetAt(msgData: MsgData, offset: number): number {
     return (offset + 1) * msgData.bigBlockSize;
 }
 
+function getBlockCount(ds: DataStream, msgData: MsgData): number {
+    return Math.max(1, Math.floor(ds.byteLength / msgData.bigBlockSize));
+}
+
 function getBlockAt(ds: DataStream, msgData: MsgData, offset: number): Int32Array {
-    var startOffset = getBlockOffsetAt(msgData, offset);
+    if (!Number.isInteger(offset) || offset < 0 || offset >= getBlockCount(ds, msgData)) {
+        throw new RangeError(`FAT block index ${offset} is out of range`);
+    }
+    const startOffset = getBlockOffsetAt(msgData, offset);
+    if (startOffset + msgData.bigBlockSize > ds.byteLength) {
+        throw new RangeError(`FAT block ${offset} extends past end of file`);
+    }
     ds.seek(startOffset);
     return ds.readInt32Array(msgData.bigBlockLength);
 }
 
-function getNextBlockInner(ds: DataStream, msgData: MsgData, offset: number, blockOffsetData: any[]): number {
-    var currentBlock = Math.floor(offset / msgData.bigBlockLength);
-    var currentBlockIndex = offset % msgData.bigBlockLength;
+function getNextBlockInner(ds: DataStream, msgData: MsgData, offset: number, blockOffsetData: number[]): number {
+    const currentBlock = Math.floor(offset / msgData.bigBlockLength);
+    const currentBlockIndex = offset % msgData.bigBlockLength;
 
-    var startBlockOffset = blockOffsetData[currentBlock];
-    if (typeof startBlockOffset == 'undefined') return CONST.MSG.END_OF_CHAIN;
+    const startBlockOffset = blockOffsetData[currentBlock];
+    if (startBlockOffset === undefined) return CONST.MSG.END_OF_CHAIN;
 
-    return getBlockAt(ds, msgData, startBlockOffset)[currentBlockIndex];
+    return getBlockAt(ds, msgData, startBlockOffset)[currentBlockIndex] as number;
 }
 
 function getNextBlock(ds: DataStream, msgData: MsgData, offset: number): number {
-    return getNextBlockInner(ds, msgData, offset, msgData.batData);
+    return getNextBlockInner(ds, msgData, offset, msgData.batData ?? []);
 }
 
 function getNextBlockSmall(ds: DataStream, msgData: MsgData, offset: number): number {
-    return getNextBlockInner(ds, msgData, offset, msgData.sbatData);
+    return getNextBlockInner(ds, msgData, offset, msgData.sbatData ?? []);
 }
 
 // convert binary data to dictionary
 function parseMsgData(ds: DataStream): MsgData {
-    var msgData: MsgData = headerData(ds);
+    const msgData: MsgData = headerData(ds);
     msgData.batData = batData(ds, msgData);
     msgData.sbatData = sbatData(ds, msgData);
     if (msgData.xbatCount > 0) {
@@ -71,7 +102,7 @@ function parseMsgData(ds: DataStream): MsgData {
     return msgData;
 }
 
-interface MsgData {
+export interface MsgData {
     bigBlockSize: number;
     bigBlockLength: number;
     xBlockLength: number;
@@ -82,17 +113,36 @@ interface MsgData {
     xbatStart: number;
     xbatCount: number;
 
-    fieldsData?: FieldsData;
-    propertyData?: Property[];
-    sbatData?: any[];
-    batData?: any[];
+    fieldsData?: MessageData;
+    propertyData?: (Property | null)[];
+    sbatData?: number[];
+    batData?: number[];
+    /** Memoized block ids backing the mini stream (root storage chain). */
+    miniStreamBlocks?: number[] | null;
 }
 
 // extract header data
-function headerData(ds): MsgData {
+function headerData(ds: DataStream): MsgData {
     const bigBlockSize =
         ds.readByte(/*const position*/ 30) == CONST.MSG.L_BIG_BLOCK_MARK ? CONST.MSG.L_BIG_BLOCK_SIZE : CONST.MSG.S_BIG_BLOCK_SIZE;
     const bigBlockLength = bigBlockSize / 4;
+
+    const batCount = ds.readInt(CONST.MSG.HEADER.BAT_COUNT_OFFSET);
+    const propertyStart = ds.readInt(CONST.MSG.HEADER.PROPERTY_START_OFFSET);
+    const sbatStart = ds.readInt(CONST.MSG.HEADER.SBAT_START_OFFSET);
+    const sbatCount = ds.readInt(CONST.MSG.HEADER.SBAT_COUNT_OFFSET);
+    const xbatStart = ds.readInt(CONST.MSG.HEADER.XBAT_START_OFFSET);
+    const xbatCount = ds.readInt(CONST.MSG.HEADER.XBAT_COUNT_OFFSET);
+
+    for (const [label, value] of [
+        ['BAT count', batCount],
+        ['SBAT count', sbatCount],
+        ['XBAT count', xbatCount],
+    ] as const) {
+        if (!Number.isInteger(value) || value < 0 || value > MAX_CHAIN_LENGTH) {
+            throw new InvalidMsgFileError(`Corrupt .msg header: invalid ${label} (${value}).`);
+        }
+    }
 
     return {
         // system data
@@ -101,34 +151,42 @@ function headerData(ds): MsgData {
         xBlockLength: bigBlockLength - 1,
 
         // header data
-        batCount: ds.readInt(CONST.MSG.HEADER.BAT_COUNT_OFFSET),
-        propertyStart: ds.readInt(CONST.MSG.HEADER.PROPERTY_START_OFFSET),
-        sbatStart: ds.readInt(CONST.MSG.HEADER.SBAT_START_OFFSET),
-        sbatCount: ds.readInt(CONST.MSG.HEADER.SBAT_COUNT_OFFSET),
-        xbatStart: ds.readInt(CONST.MSG.HEADER.XBAT_START_OFFSET),
-        xbatCount: ds.readInt(CONST.MSG.HEADER.XBAT_COUNT_OFFSET),
+        batCount,
+        propertyStart,
+        sbatStart,
+        sbatCount,
+        xbatStart,
+        xbatCount,
     };
 }
 
 function batCountInHeader(msgData: MsgData): number {
-    var maxBatsInHeader = (CONST.MSG.S_BIG_BLOCK_SIZE - CONST.MSG.HEADER.BAT_START_OFFSET) / 4;
-    return Math.min(msgData.batCount, maxBatsInHeader);
+    const maxBatsInHeader = Math.floor((CONST.MSG.S_BIG_BLOCK_SIZE - CONST.MSG.HEADER.BAT_START_OFFSET) / 4);
+    return Math.min(Math.max(msgData.batCount, 0), maxBatsInHeader);
 }
 
 function batData(ds: DataStream, msgData: MsgData): number[] {
-    var result = new Array(batCountInHeader(msgData));
+    const result = new Array<number>(batCountInHeader(msgData));
     ds.seek(CONST.MSG.HEADER.BAT_START_OFFSET);
-    for (var i = 0; i < result.length; i++) {
+    for (let i = 0; i < result.length; i++) {
         result[i] = ds.readInt32();
     }
     return result;
 }
 
-function sbatData(ds: DataStream, msgData: MsgData): number[] {
-    var result = [];
-    var startIndex = msgData.sbatStart;
+function isChainTerminator(block: number): boolean {
+    return block === CONST.MSG.END_OF_CHAIN || block === CONST.MSG.UNUSED_BLOCK;
+}
 
-    for (var i = 0; i < msgData.sbatCount && startIndex && startIndex != CONST.MSG.END_OF_CHAIN; i++) {
+function sbatData(ds: DataStream, msgData: MsgData): number[] {
+    const result: number[] = [];
+    let startIndex = msgData.sbatStart;
+    const seen = new Set<number>();
+
+    // NB: block 0 is a valid block id, so it must not be treated as falsy.
+    for (let i = 0; i < msgData.sbatCount && startIndex >= 0 && !isChainTerminator(startIndex); i++) {
+        if (seen.has(startIndex)) break; // cyclic FAT — stop instead of looping forever
+        seen.add(startIndex);
         result.push(startIndex);
         startIndex = getNextBlock(ds, msgData, startIndex);
     }
@@ -136,65 +194,88 @@ function sbatData(ds: DataStream, msgData: MsgData): number[] {
 }
 
 function xbatData(ds: DataStream, msgData: MsgData): void {
-    var batCount = batCountInHeader(msgData);
-    var batCountTotal = msgData.batCount;
-    var remainingBlocks = batCountTotal - batCount;
+    const batDataRef = msgData.batData;
+    if (!batDataRef) return;
+    const batCount = batCountInHeader(msgData);
+    const batCountTotal = msgData.batCount;
+    let remainingBlocks = batCountTotal - batCount;
 
-    var nextBlockAt = msgData.xbatStart;
-    for (var i = 0; i < msgData.xbatCount; i++) {
-        var xBatBlock = getBlockAt(ds, msgData, nextBlockAt);
+    let nextBlockAt = msgData.xbatStart;
+    const seen = new Set<number>();
+    for (let i = 0; i < msgData.xbatCount && remainingBlocks > 0; i++) {
+        if (nextBlockAt < 0 || seen.has(nextBlockAt)) break;
+        seen.add(nextBlockAt);
+        const xBatBlock = getBlockAt(ds, msgData, nextBlockAt);
 
-        var blocksToProcess = Math.min(remainingBlocks, msgData.xBlockLength);
-        for (var j = 0; j < blocksToProcess; j++) {
-            var blockStartAt = xBatBlock[j];
-            if (blockStartAt == CONST.MSG.UNUSED_BLOCK || blockStartAt == CONST.MSG.END_OF_CHAIN) {
+        const blocksToProcess = Math.min(remainingBlocks, msgData.xBlockLength);
+        for (let j = 0; j < blocksToProcess; j++) {
+            const blockStartAt = xBatBlock[j] as number;
+            if (isChainTerminator(blockStartAt)) {
                 break;
             }
-            msgData.batData.push(blockStartAt);
+            batDataRef.push(blockStartAt);
         }
         remainingBlocks -= blocksToProcess;
 
-        nextBlockAt = xBatBlock[msgData.xBlockLength];
-        if (nextBlockAt == CONST.MSG.UNUSED_BLOCK || nextBlockAt == CONST.MSG.END_OF_CHAIN) break;
+        nextBlockAt = xBatBlock[msgData.xBlockLength] as number;
+        if (isChainTerminator(nextBlockAt)) break;
     }
 }
 
 // extract property data and property hierarchy
-function propertyData(ds: DataStream, msgData: MsgData): Property[] {
-    var props: Property[] = [];
+function propertyData(ds: DataStream, msgData: MsgData): (Property | null)[] {
+    const props: (Property | null)[] = [];
 
-    var currentOffset = msgData.propertyStart;
-
-    while (currentOffset != CONST.MSG.END_OF_CHAIN) {
-        convertBlockToProperties(ds, msgData, currentOffset, props);
-        currentOffset = getNextBlock(ds, msgData, currentOffset);
+    if (msgData.propertyStart < 0) {
+        throw new InvalidMsgFileError('Corrupt .msg file: missing property storage.');
     }
-    createPropertyHierarchy(props, /*property with index 0 (zero) always as root*/ props[0]);
+
+    let currentOffset = msgData.propertyStart;
+    const seen = new Set<number>();
+    const maxBlocks = getBlockCount(ds, msgData) + 1;
+    let blocksWalked = 0;
+
+    while (currentOffset !== CONST.MSG.END_OF_CHAIN) {
+        if (currentOffset < 0 || seen.has(currentOffset)) {
+            throw new InvalidMsgFileError('Corrupt .msg file: broken property chain.');
+        }
+        seen.add(currentOffset);
+        convertBlockToProperties(ds, msgData, currentOffset, props);
+        if (props.length > MAX_PROPERTIES) {
+            throw new InvalidMsgFileError('Corrupt .msg file: too many directory entries.');
+        }
+        currentOffset = getNextBlock(ds, msgData, currentOffset);
+        if (++blocksWalked > maxBlocks) {
+            throw new InvalidMsgFileError('Corrupt .msg file: property chain is too long.');
+        }
+    }
+    const root = props[0];
+    if (!root || root.type !== PropertyType.Root) {
+        throw new InvalidMsgFileError('Corrupt .msg file: missing root storage entry.');
+    }
+    createPropertyHierarchy(props, /*property with index 0 (zero) always as root*/ root);
     return props;
 }
 
 function convertName(ds: DataStream, offset: number): string {
-    var nameLength = ds.readShort(offset + CONST.MSG.PROP.NAME_SIZE_OFFSET);
+    const nameLength = ds.readShort(offset + CONST.MSG.PROP.NAME_SIZE_OFFSET);
     if (nameLength < 1) {
         return '';
     } else {
-        return ds.readStringAt(offset, nameLength / 2);
+        return stripTrailingNul(ds.readStringAt(offset, nameLength / 2));
     }
 }
 
-/**
- * CONST.MSG.PROP.TYPE_ENUM
- */
-enum TypeEnum {
-    DIRECTORY = 1,
-    DOCUMENT = 2,
-    ROOT = 5,
+export enum PropertyType {
+    Directory = 1,
+    Document = 2,
+    Root = 5,
 }
 
-interface Property {
+export interface Property {
     index: number;
 
-    type: TypeEnum;
+    type: PropertyType;
     name: string;
     previousProperty: number;
     nextProperty: number;
@@ -207,7 +288,7 @@ interface Property {
 function convertProperty(ds: DataStream, index: number, offset: number): Property {
     return {
         index: index,
-        type: ds.readByte(offset + CONST.MSG.PROP.TYPE_OFFSET),
+        type: ds.readByte(offset + CONST.MSG.PROP.TYPE_OFFSET) as PropertyType,
         name: convertName(ds, offset),
         // hierarchy
         previousProperty: ds.readInt(offset + CONST.MSG.PROP.PREVIOUS_PROPERTY_OFFSET),
@@ -219,171 +300,201 @@ function convertProperty(ds: DataStream, index: number, offset: number): Propert
     };
 }
 
-function convertBlockToProperties(ds: DataStream, msgData: MsgData, propertyBlockOffset: number, props: Property[]): void {
-    var propertyCount = msgData.bigBlockSize / CONST.MSG.PROP.PROPERTY_SIZE;
-    var propertyOffset = getBlockOffsetAt(msgData, propertyBlockOffset);
+function convertBlockToProperties(
+    ds: DataStream,
+    msgData: MsgData,
+    propertyBlockOffset: number,
+    props: (Property | null)[]
+): void {
+    const propertyCount = Math.floor(msgData.bigBlockSize / CONST.MSG.PROP.PROPERTY_SIZE);
+    const propertyOffset = getBlockOffsetAt(msgData, propertyBlockOffset);
 
-    for (var i = 0; i < propertyCount; i++) {
-        if (ds.byteLength < propertyOffset + CONST.MSG.PROP.TYPE_OFFSET) break;
+    for (let i = 0; i < propertyCount; i++) {
+        const entryOffset = propertyOffset + i * CONST.MSG.PROP.PROPERTY_SIZE;
+        if (ds.byteLength < entryOffset + CONST.MSG.PROP.PROPERTY_SIZE) break;
 
-        var propertyType = ds.readByte(propertyOffset + CONST.MSG.PROP.TYPE_OFFSET);
+        const propertyType = ds.readByte(entryOffset + CONST.MSG.PROP.TYPE_OFFSET);
         switch (propertyType) {
             case CONST.MSG.PROP.TYPE_ENUM.ROOT:
             case CONST.MSG.PROP.TYPE_ENUM.DIRECTORY:
             case CONST.MSG.PROP.TYPE_ENUM.DOCUMENT:
-                props.push(convertProperty(ds, props.length, propertyOffset));
+                props.push(convertProperty(ds, props.length, entryOffset));
                 break;
             default:
                 /* unknown property types */
                 props.push(null);
         }
-
-        propertyOffset += CONST.MSG.PROP.PROPERTY_SIZE;
     }
 }
 
-function createPropertyHierarchy(props: Property[], nodeProperty: Property): void {
-    if (!nodeProperty || nodeProperty.childProperty == CONST.MSG.PROP.NO_INDEX) {
-        return;
-    }
-    nodeProperty.children = [];
+function createPropertyHierarchy(props: (Property | null)[], nodeProperty: Property): void {
+    const built = new Set<number>();
+    const build = (node: Property): void => {
+        if (built.has(node.index)) return;
+        built.add(node.index);
+        if (node.childProperty === CONST.MSG.PROP.NO_INDEX) {
+            node.children = [];
+            return;
+        }
+        node.children = [];
+        const seen = new Set<number>();
+        const queue: number[] = [node.childProperty];
+        for (let head = 0; head < queue.length; head++) {
+            const currentIndex = queue[head] as number;
+            if (currentIndex === CONST.MSG.PROP.NO_INDEX || seen.has(currentIndex)) continue;
+            seen.add(currentIndex);
+            const current = currentIndex >= 0 && currentIndex < props.length ? props[currentIndex] ?? null : null;
+            if (current == null) {
+                continue;
+            }
+            (node.children as number[]).push(currentIndex);
 
-    var children = [nodeProperty.childProperty];
-    while (children.length != 0) {
-        var currentIndex = children.shift();
-        var current = props[currentIndex];
-        if (current == null) {
-            continue;
+            if (current.type === PropertyType.Directory) {
+                build(current);
+            }
+            if (current.previousProperty !== CONST.MSG.PROP.NO_INDEX) {
+                queue.push(current.previousProperty);
+            }
+            if (current.nextProperty !== CONST.MSG.PROP.NO_INDEX) {
+                queue.push(current.nextProperty);
+            }
         }
-        nodeProperty.children.push(currentIndex);
+    };
+    build(nodeProperty);
+}
 
-        if (current.type == CONST.MSG.PROP.TYPE_ENUM.DIRECTORY) {
-            createPropertyHierarchy(props, current);
-        }
-        if (current.previousProperty != CONST.MSG.PROP.NO_INDEX) {
-            children.push(current.previousProperty);
-        }
-        if (current.nextProperty != CONST.MSG.PROP.NO_INDEX) {
-            children.push(current.nextProperty);
-        }
-    }
+/** String-valued message fields (see CONST.MSG.FIELD.NAME_MAPPING). */
+export interface MessageTextFields {
+    /** PidTagSubject (0037). */
+    subject?: string;
+    /** PidTagNormalizedSubject (0E1D). */
+    normalizedSubject?: string;
+    /** PidTagSubjectPrefix (003D). */
+    subjectPrefix?: string;
+    /** PidTagMessageClass (001A), e.g. `IPM.Note`. */
+    messageClass?: string;
+    /** PidTagSenderName (0C1A). */
+    senderName?: string;
+    /** PidTagSenderEmailAddress (0C1F). */
+    senderEmail?: string;
+    /** PidTagSenderSmtpAddress (0C1E). */
+    senderSmtpAddress?: string;
+    /** PidTagBody (1000), plain text. */
+    body?: string;
+    /** PidTagBodyHtml (1013), raw HTML bytes when present. */
+    bodyHtml?: Uint8Array;
+    /** PidTagTransportMessageHeaders (007D). */
+    headers?: string;
+    /** PidTagRtfCompressed (1009). Use getRtfBody() to decompress. */
+    compressedRtf?: Uint8Array;
+    /** PidTagInternetMessageId (1035). */
+    internetMessageId?: string;
+    /** PidTagDisplayTo (0E04). */
+    displayTo?: string;
+    /** PidTagDisplayCc (0E03). */
+    displayCc?: string;
+    /** PidTagDisplayBcc (0E02). */
+    displayBcc?: string;
+}
+
+export interface Attachment {
+    /** Index into the property table of the `__substg1.3701*` stream. */
+    dataId: number;
+    /** Declared byte length of the attachment content. */
+    contentLength: number;
+    /** PidTagAttachLongFilename (3707). */
+    fileName?: string;
+    /** PidTagAttachFilename (3704, 8.3 short name). */
+    fileNameShort?: string;
+    /** PidTagAttachExtension (3703). */
+    extension?: string;
+    /** PidTagAttachMimeTag (370E). */
+    mimeType?: string;
+    /** PidTagAttachContentId (3712). */
+    pidContentId?: string;
+    /** PidTagAttachContentLocation (3716). */
+    attachContentLocation?: string;
+    /** PidTagAttachMethod (3705). */
+    attachMethod?: number;
+    /**
+     * True when the attachment embeds another message (unsupported content).
+     * @deprecated Use hasInnerMsg instead.
+     */
+    innerMsgContent?: boolean;
+    /** True when the attachment embeds another message (unsupported content). */
+    hasInnerMsg?: boolean;
+    /** Decoded values for tags without a friendly name, keyed by 4-hex-digit class. */
+    extraProperties?: Record<string, unknown>;
+}
+
+export interface Recipient {
+    /** PidTagDisplayName (3001). */
+    name?: string;
+    /** PidTagEmailAddress (3003). */
+    email?: string;
+    /** PidTagAddressType (3002), e.g. `SMTP`. */
+    addressType?: string;
+    /** PidTagSmtpAddress (39FE). */
+    smtpAddress?: string;
+    /** PidTagSearchKey (300B). */
+    searchKey?: Uint8Array;
+    /** Decoded values for tags without a friendly name, keyed by 4-hex-digit class. */
+    extraProperties?: Record<string, unknown>;
+}
+
+export interface MessageData extends MessageTextFields {
+    attachments: Attachment[];
+    recipients: Recipient[];
+    /** Decoded values for tags without a friendly name, keyed by 4-hex-digit class. */
+    extraProperties: Record<string, unknown>;
 }
 
 /**
- * Some OXPROPS
- *
- * Note that please sync with: CONST.MSG.FIELD.NAME_MAPPING
+ * Backwards-compatible alias for MessageData.
+ * (The legacy `error`/`dataId`/`contentLength`/`innerMsgContent` members are
+ * no longer populated; invalid files now throw InvalidMsgFileError.)
  */
-interface SomeOxProps {
-    /**
-     * Contains the subject of the email message.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/0037-PidTagSubject.md
-     */
-    subject?: string;
+export type FieldsData = MessageData;
 
-    /**
-     * Contains the display name of the sending mailbox owner.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/0C1A-PidTagSenderName.md
-     */
-    senderName?: string;
-
-    /**
-     * Contains the email address of the sending mailbox owner.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/0C1F-PidTagSenderEmailAddress.md
-     */
-    senderEmail?: string;
-
-    /**
-     * Contains message body text in plain text format.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/1000-PidTagBody.md
-     */
-    body?: string;
-
-    /**
-     * Contains transport-specific message envelope information for email.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/007D-PidTagTransportMessageHeaders.md
-     */
-    headers?: string;
-
-    /**
-     * Contains message body text in compressed RTF format.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/1009-PidTagRtfCompressed.md
-     */
-    compressedRtf?: Uint8Array;
-
-    /**
-     * Contains a file name extension that indicates the document type of an attachment.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/3703-PidTagAttachExtension.md
-     */
-    extension?: string;
-
-    fileNameShort?: string;
-
-    /**
-     * Contains the full filename and extension of the Attachment object.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/3707-PidTagAttachLongFilename.md
-     */
+/** Fully decoded attachment content. */
+export interface AttachmentContent {
     fileName?: string;
-
-    /**
-     * Contains a content identifier unique to the Message object that matches a
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/3712-PidTagAttachContentId.md
-     */
+    fileNameShort?: string;
+    extension?: string;
+    mimeType?: string;
     pidContentId?: string;
-
-    /**
-     * Contains the display name of the folder.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/3001-PidTagDisplayName.md
-     */
-    name?: string;
-
-    /**
-     * Contains the email address of a Message object.
-     *
-     * @see https://github.com/HiraokaHyperTools/OXPROPS/blob/master/JSON/3003-PidTagEmailAddress.md
-     */
-    email?: string;
-}
-
-interface FieldsData extends SomeOxProps {
-    contentLength?: number;
-    dataId?: any;
-    innerMsgContent?: boolean;
-    attachments?: FieldsData[];
-    recipients?: FieldsData[];
-    error?: string;
+    contentLength: number;
+    content: Uint8Array;
 }
 
 // extract real fields
-function fieldsData(ds: DataStream, msgData: MsgData): FieldsData {
-    var fields = {
+function fieldsData(ds: DataStream, msgData: MsgData): MessageData {
+    const fields: MessageData = {
         attachments: [],
         recipients: [],
+        extraProperties: {},
     };
-    fieldsDataDir(ds, msgData, msgData.propertyData[0], fields);
+    const root = msgData.propertyData?.[0] ?? null;
+    if (root) {
+        fieldsDataDir(ds, msgData, root, fields);
+    }
     return fields;
 }
 
-function fieldsDataDir(ds: DataStream, msgData: MsgData, dirProperty: Property, fields: FieldsData) {
+function fieldsDataDir(ds: DataStream, msgData: MsgData, dirProperty: Property, fields: MessageData | Attachment | Recipient): void {
     if (dirProperty && dirProperty.children && dirProperty.children.length > 0) {
-        for (var i = 0; i < dirProperty.children.length; i++) {
-            var childProperty = msgData.propertyData[dirProperty.children[i]];
+        const propertyDataRef = msgData.propertyData;
+        if (!propertyDataRef) return;
+        for (let i = 0; i < dirProperty.children.length; i++) {
+            const childIndex = dirProperty.children[i] as number;
+            const childProperty = childIndex >= 0 && childIndex < propertyDataRef.length ? propertyDataRef[childIndex] ?? null : null;
+            if (childProperty == null) continue;
 
-            if (childProperty.type == CONST.MSG.PROP.TYPE_ENUM.DIRECTORY) {
+            if (childProperty.type === PropertyType.Directory) {
                 fieldsDataDirInner(ds, msgData, childProperty, fields);
             } else if (
-                childProperty.type == CONST.MSG.PROP.TYPE_ENUM.DOCUMENT &&
-                childProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.DOCUMENT) == 0
+                childProperty.type === PropertyType.Document &&
+                childProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.DOCUMENT) === 0
             ) {
                 fieldsDataDocument(ds, msgData, childProperty, fields);
             }
@@ -391,241 +502,381 @@ function fieldsDataDir(ds: DataStream, msgData: MsgData, dirProperty: Property, 
     }
 }
 
-function fieldsDataDirInner(ds: DataStream, msgData: MsgData, dirProperty: Property, fields: FieldsData): void {
-    if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.ATTACHMENT) == 0) {
+function fieldsDataDirInner(
+    ds: DataStream,
+    msgData: MsgData,
+    dirProperty: Property,
+    fields: MessageData | Attachment | Recipient
+): void {
+    if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.ATTACHMENT) === 0) {
         // attachment
-        var attachmentField = {};
-        fields.attachments.push(attachmentField);
+        const attachmentField: Attachment = { dataId: -1, contentLength: 0, extraProperties: {} };
+        (fields as MessageData).attachments.push(attachmentField);
         fieldsDataDir(ds, msgData, dirProperty, attachmentField);
-    } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.RECIPIENT) == 0) {
+    } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.RECIPIENT) === 0) {
         // recipient
-        var recipientField = {};
-        fields.recipients.push(recipientField);
+        const recipientField: Recipient = { extraProperties: {} };
+        (fields as MessageData).recipients.push(recipientField);
         fieldsDataDir(ds, msgData, dirProperty, recipientField);
-    } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.NAMEID) == 0) {
+    } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.NAMEID) === 0) {
         // unknown, skip
     } else {
         // other dir
-        var childFieldType = getFieldType(dirProperty);
-        if (childFieldType != CONST.MSG.FIELD.DIR_TYPE.INNER_MSG) {
+        const childFieldType = getFieldType(dirProperty);
+        if (childFieldType !== CONST.MSG.FIELD.DIR_TYPE.INNER_MSG) {
             fieldsDataDir(ds, msgData, dirProperty, fields);
         } else {
             // MSG as attachment currently isn't supported
-            fields.innerMsgContent = true;
+            (fields as Attachment).innerMsgContent = true;
+            (fields as Attachment).hasInnerMsg = true;
         }
     }
 }
 
-function fieldsDataDocument(ds: DataStream, msgData: MsgData, documentProperty: Property, fields: FieldsData): void {
-    var value = documentProperty.name.substring(12).toLowerCase();
-    var fieldClass = value.substring(0, 4);
-    var fieldType = value.substring(4, 8);
+const SUBSTG_PATTERN = /^__substg1\.0?([0-9a-f]{4})([0-9a-f]{4})/i;
 
-    var fieldName = CONST.MSG.FIELD.NAME_MAPPING[fieldClass];
+function splitSubstgName(name: string): { fieldClass: string; fieldType: string } | null {
+    const match = SUBSTG_PATTERN.exec(name);
+    if (!match) {
+        // legacy fallback for nonstandard name shapes
+        const value = name.substring(12).toLowerCase();
+        if (value.length < 8) return null;
+        return { fieldClass: value.substring(0, 4), fieldType: value.substring(4, 8) };
+    }
+    return { fieldClass: (match[1] as string).toLowerCase(), fieldType: (match[2] as string).toLowerCase() };
+}
+
+function fieldsDataDocument(
+    ds: DataStream,
+    msgData: MsgData,
+    documentProperty: Property,
+    fields: MessageData | Attachment | Recipient
+): void {
+    const split = splitSubstgName(documentProperty.name);
+    if (!split) return;
+    const { fieldClass, fieldType } = split;
+
+    const fieldName = CONST.MSG.FIELD.NAME_MAPPING[fieldClass];
+    const value = safeGetFieldValue(ds, msgData, documentProperty, fieldType);
 
     if (fieldName) {
-        fields[fieldName] = getFieldValue(ds, msgData, documentProperty, fieldType);
+        if (value !== null && value !== undefined) {
+            (fields as unknown as Record<string, unknown>)[fieldName] = value;
+        }
+    } else if (value !== null && value !== undefined && fieldClass !== CONST.MSG.FIELD.CLASS_MAPPING.ATTACHMENT_DATA) {
+        // Keep forward-compat data for tags without a friendly name, but only
+        // scalar values: binaries (notably the 3701 attachment payload) would
+        // needlessly duplicate memory.
+        if (!(value instanceof Uint8Array)) {
+            const extra = (fields as MessageData | Attachment | Recipient).extraProperties ?? {};
+            extra[fieldClass] = value;
+            (fields as MessageData | Attachment | Recipient).extraProperties = extra;
+        }
     }
-    if (fieldClass == CONST.MSG.FIELD.CLASS_MAPPING.ATTACHMENT_DATA) {
+    if (fieldClass === CONST.MSG.FIELD.CLASS_MAPPING.ATTACHMENT_DATA) {
         // attachment specific info
-        fields.dataId = documentProperty.index;
-        fields.contentLength = documentProperty.sizeBlock;
+        (fields as Attachment).dataId = documentProperty.index;
+        (fields as Attachment).contentLength = documentProperty.sizeBlock;
     }
 }
 
 function getFieldType(fieldProperty: Property): string {
-    var value = fieldProperty.name.substring(12).toLowerCase();
-    return value.substring(4, 8);
+    return splitSubstgName(fieldProperty.name)?.fieldType ?? '';
 }
 
-// extractor structure to manage bat/sbat block types and different data types
-var extractorFieldValue = {
-    sbat: {
-        extractor: function extractDataViaSbat(
-            ds: DataStream,
-            msgData: MsgData,
-            fieldProperty: Property,
-            dataTypeExtractor: (
-                ds: DataStream,
-                msgData: MsgData,
-                blockStartOffset: number,
-                bigBlockOffset: number,
-                blockSize: number
-            ) => any
-        ) {
-            var chain = getChainByBlockSmall(ds, msgData, fieldProperty);
-            if (chain.length == 1) {
-                return readDataByBlockSmall(ds, msgData, fieldProperty.startBlock, fieldProperty.sizeBlock, dataTypeExtractor);
-            } else if (chain.length > 1) {
-                return readChainDataByBlockSmall(ds, msgData, fieldProperty, chain, dataTypeExtractor);
-            }
-            return null;
-        },
-        dataType: {
-            string: function extractBatString(
-                ds: DataStream,
-                msgData: MsgData,
-                blockStartOffset: number,
-                bigBlockOffset: number,
-                blockSize: number
-            ) {
-                ds.seek(blockStartOffset + bigBlockOffset);
-                return ds.readString(blockSize);
-            },
-            unicode: function extractBatUnicode(
-                ds: DataStream,
-                msgData: MsgData,
-                blockStartOffset: number,
-                bigBlockOffset: number,
-                blockSize: number
-            ) {
-                ds.seek(blockStartOffset + bigBlockOffset);
-                return ds.readUCS2String(blockSize / 2);
-            },
-            binary: function extractBatBinary(
-                ds: DataStream,
-                msgData: MsgData,
-                blockStartOffset: number,
-                bigBlockOffset: number,
-                blockSize: number
-            ) {
-                ds.seek(blockStartOffset + bigBlockOffset);
-                return ds.readUint8Array(blockSize);
-            },
-        },
-    },
-    bat: {
-        extractor: function extractDataViaBat(
-            ds: DataStream,
-            msgData: MsgData,
-            fieldProperty: Property,
-            dataTypeExtractor: (ds: DataStream, fieldProperty: Property) => any
-        ) {
-            var offset = getBlockOffsetAt(msgData, fieldProperty.startBlock);
-            ds.seek(offset);
-            return dataTypeExtractor(ds, fieldProperty);
-        },
-        dataType: {
-            string: function extractSbatString(ds: DataStream, fieldProperty: Property) {
-                return ds.readString(fieldProperty.sizeBlock);
-            },
-            unicode: function extractSbatUnicode(ds: DataStream, fieldProperty: Property) {
-                return ds.readUCS2String(fieldProperty.sizeBlock / 2);
-            },
-            binary: function extractSbatBinary(ds: DataStream, fieldProperty: Property) {
-                return ds.readUint8Array(fieldProperty.sizeBlock);
-            },
-        },
-    },
-};
-
-function readDataByBlockSmall(
-    ds: DataStream,
-    msgData: MsgData,
-    startBlock: number,
-    blockSize: number,
-    dataTypeExtractor: (ds: DataStream, msgData: MsgData, blockStartOffset: number, bigBlockOffset: number, blockSize: number) => any
-) {
-    var byteOffset = startBlock * CONST.MSG.SMALL_BLOCK_SIZE;
-    var bigBlockNumber = Math.floor(byteOffset / msgData.bigBlockSize);
-    var bigBlockOffset = byteOffset % msgData.bigBlockSize;
-
-    var rootProp = msgData.propertyData[0];
-
-    var nextBlock = rootProp.startBlock;
-    for (var i = 0; i < bigBlockNumber; i++) {
-        nextBlock = getNextBlock(ds, msgData, nextBlock);
+/** Block ids backing the mini stream, memoized per parsed file. */
+function getMiniStreamBlocks(ds: DataStream, msgData: MsgData): number[] {
+    if (msgData.miniStreamBlocks !== undefined && msgData.miniStreamBlocks !== null) {
+        return msgData.miniStreamBlocks;
     }
-    var blockStartOffset = getBlockOffsetAt(msgData, nextBlock);
-
-    return dataTypeExtractor(ds, msgData, blockStartOffset, bigBlockOffset, blockSize);
-}
-
-function readChainDataByBlockSmall(
-    ds: DataStream,
-    msgData: MsgData,
-    fieldProperty: Property,
-    chain: number[],
-    dataTypeExtractor: (ds: DataStream, msgData: MsgData, blockStartOffset: number, bigBlockOffset: number, blockSize: number) => any
-) {
-    var resultData = new Int8Array(fieldProperty.sizeBlock);
-
-    for (var i = 0, idx = 0; i < chain.length; i++) {
-        var data = readDataByBlockSmall(ds, msgData, chain[i], CONST.MSG.SMALL_BLOCK_SIZE, extractorFieldValue.sbat.dataType.binary);
-        for (var j = 0; j < data.length; j++) {
-            resultData[idx++] = data[j];
+    const blocks: number[] = [];
+    const rootProp = msgData.propertyData?.[0] ?? null;
+    if (rootProp && rootProp.startBlock >= 0) {
+        const seen = new Set<number>();
+        const maxBlocks = getBlockCount(ds, msgData) + 1;
+        let nextBlock = rootProp.startBlock;
+        while (!isChainTerminator(nextBlock) && nextBlock >= 0 && !seen.has(nextBlock) && blocks.length < maxBlocks) {
+            seen.add(nextBlock);
+            blocks.push(nextBlock);
+            nextBlock = getNextBlock(ds, msgData, nextBlock);
         }
     }
-    var localDs = new DataStream(resultData, 0, DataStream.LITTLE_ENDIAN);
-    return dataTypeExtractor(localDs, msgData, 0, 0, fieldProperty.sizeBlock);
+    msgData.miniStreamBlocks = blocks;
+    return blocks;
 }
 
-function getChainByBlockSmall(ds: DataStream, msgData: MsgData, fieldProperty: Property): number[] {
-    var blockChain = [];
-    var nextBlockSmall = fieldProperty.startBlock;
-    while (nextBlockSmall != CONST.MSG.END_OF_CHAIN) {
+/** Reads `length` bytes at mini-stream byte offset `byteOffset`. */
+function readMiniByteRange(ds: DataStream, msgData: MsgData, byteOffset: number, length: number): Uint8Array {
+    const miniBlocks = getMiniStreamBlocks(ds, msgData);
+    const result = new Uint8Array(length);
+    let filled = 0;
+    while (filled < length) {
+        const pos = byteOffset + filled;
+        const bigBlockIndex = Math.floor(pos / msgData.bigBlockSize);
+        const bigBlockOffset = pos % msgData.bigBlockSize;
+        const blockId = miniBlocks[bigBlockIndex];
+        if (blockId === undefined || blockId < 0) {
+            throw new RangeError(`Mini stream byte offset ${pos} is out of range`);
+        }
+        const fileOffset = getBlockOffsetAt(msgData, blockId) + bigBlockOffset;
+        const run = Math.min(length - filled, msgData.bigBlockSize - bigBlockOffset);
+        if (fileOffset + run > ds.byteLength) {
+            throw new RangeError('Mini stream data extends past end of file');
+        }
+        ds.seek(fileOffset);
+        result.set(ds.readUint8Array(run), filled);
+        filled += run;
+    }
+    return result;
+}
+
+function getMiniChain(ds: DataStream, msgData: MsgData, fieldProperty: Property): number[] {
+    const blockChain: number[] = [];
+    const maxBlocks = Math.ceil(fieldProperty.sizeBlock / CONST.MSG.SMALL_BLOCK_SIZE) + 1;
+    let nextBlockSmall = fieldProperty.startBlock;
+    const seen = new Set<number>();
+    while (!isChainTerminator(nextBlockSmall) && nextBlockSmall >= 0 && !seen.has(nextBlockSmall)) {
+        seen.add(nextBlockSmall);
         blockChain.push(nextBlockSmall);
+        if (blockChain.length > maxBlocks || blockChain.length > MAX_CHAIN_LENGTH) break;
         nextBlockSmall = getNextBlockSmall(ds, msgData, nextBlockSmall);
     }
     return blockChain;
 }
 
-function getFieldValue(ds: DataStream, msgData: MsgData, fieldProperty: Property, type: string): any {
-    var value = null;
-
-    if (fieldProperty.sizeBlock < CONST.MSG.BIG_BLOCK_MIN_DOC_SIZE) {
-        const valueExtractor = extractorFieldValue.sbat;
-        const dataTypeExtractor: (
-            ds: DataStream,
-            msgData: MsgData,
-            blockStartOffset: number,
-            bigBlockOffset: number,
-            blockSize: number
-        ) => any = valueExtractor.dataType[CONST.MSG.FIELD.TYPE_MAPPING[type]];
-
-        if (dataTypeExtractor) {
-            value = valueExtractor.extractor(ds, msgData, fieldProperty, dataTypeExtractor);
-        }
-        return value;
-    } else {
-        const valueExtractor = extractorFieldValue.bat;
-        const dataTypeExtractor: (ds: DataStream, fieldProperty: Property) => any =
-            valueExtractor.dataType[CONST.MSG.FIELD.TYPE_MAPPING[type]];
-
-        if (dataTypeExtractor) {
-            value = valueExtractor.extractor(ds, msgData, fieldProperty, dataTypeExtractor);
-        }
+function getBigChain(ds: DataStream, msgData: MsgData, fieldProperty: Property): number[] {
+    const blockChain: number[] = [];
+    const needed = Math.ceil(fieldProperty.sizeBlock / msgData.bigBlockSize);
+    const maxBlocks = Math.min(needed + 1, MAX_CHAIN_LENGTH);
+    let nextBlock = fieldProperty.startBlock;
+    const seen = new Set<number>();
+    while (!isChainTerminator(nextBlock) && nextBlock >= 0 && !seen.has(nextBlock) && blockChain.length < maxBlocks) {
+        seen.add(nextBlock);
+        blockChain.push(nextBlock);
+        nextBlock = getNextBlock(ds, msgData, nextBlock);
     }
-    return value;
+    return blockChain;
+}
+
+function readBigByteRange(ds: DataStream, msgData: MsgData, chain: number[], sizeBlock: number): Uint8Array {
+    const parts: Uint8Array[] = [];
+    let remaining = sizeBlock;
+    for (const blockId of chain) {
+        if (remaining <= 0) break;
+        const fileOffset = getBlockOffsetAt(msgData, blockId);
+        const chunkLength = Math.min(remaining, msgData.bigBlockSize);
+        if (fileOffset + chunkLength > ds.byteLength) {
+            throw new RangeError('Stream data extends past end of file');
+        }
+        ds.seek(fileOffset);
+        parts.push(ds.readUint8Array(chunkLength));
+        remaining -= chunkLength;
+    }
+    if (remaining > 0) {
+        throw new RangeError('Stream chain is shorter than the declared stream size');
+    }
+    return concatUint8Arrays(parts, sizeBlock);
+}
+
+/**
+ * Materializes the raw bytes of a DOCUMENT stream, following the BAT chain
+ * for large streams and the SBAT/mini-stream chain for small ones.
+ */
+function getFieldBytes(ds: DataStream, msgData: MsgData, fieldProperty: Property): Uint8Array | null {
+    if (!fieldProperty || fieldProperty.type !== PropertyType.Document) return null;
+    const sizeBlock = fieldProperty.sizeBlock;
+    if (!Number.isInteger(sizeBlock) || sizeBlock < 0 || sizeBlock > MAX_DOCUMENT_SIZE) {
+        throw new RangeError(`Stream "${fieldProperty.name}" has an invalid size (${sizeBlock})`);
+    }
+    if (sizeBlock === 0 || fieldProperty.startBlock === CONST.MSG.END_OF_CHAIN) {
+        return new Uint8Array(0);
+    }
+
+    if (sizeBlock < CONST.MSG.BIG_BLOCK_MIN_DOC_SIZE) {
+        const chain = getMiniChain(ds, msgData, fieldProperty);
+        if (chain.length === 0) {
+            throw new RangeError(`Stream "${fieldProperty.name}" has no mini blocks`);
+        }
+        if (chain.length * CONST.MSG.SMALL_BLOCK_SIZE < sizeBlock) {
+            throw new RangeError(`Stream "${fieldProperty.name}" chain is shorter than the declared stream size`);
+        }
+        if (chain.length === 1) {
+            return readMiniByteRange(ds, msgData, (chain[0] as number) * CONST.MSG.SMALL_BLOCK_SIZE, sizeBlock);
+        }
+        const parts = chain.map((block) =>
+            readMiniByteRange(ds, msgData, block * CONST.MSG.SMALL_BLOCK_SIZE, CONST.MSG.SMALL_BLOCK_SIZE)
+        );
+        return concatUint8Arrays(parts, sizeBlock).slice(0, sizeBlock);
+    }
+
+    const chain = getBigChain(ds, msgData, fieldProperty);
+    if (chain.length === 0) {
+        throw new RangeError(`Stream "${fieldProperty.name}" has no data blocks`);
+    }
+    return readBigByteRange(ds, msgData, chain, sizeBlock);
+}
+
+function decodeFieldValue(bytes: Uint8Array, type: string): string | Uint8Array | number | boolean | Date | null {
+    const kind = CONST.MSG.FIELD.TYPE_MAPPING[type];
+    switch (kind) {
+        case 'string':
+            return stripTrailingNul(new TextDecoder('windows-1252').decode(bytes));
+        case 'unicode':
+            return stripTrailingNul(new TextDecoder('utf-16le').decode(bytes));
+        case 'binary':
+            return bytes;
+        case 'int':
+            if (bytes.length < 4) return null;
+            return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(0, true);
+        case 'bool':
+            if (bytes.length < 2) return null;
+            return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(0, true) !== 0;
+        case 'time':
+            if (bytes.length < 8) return null;
+            return fileTimeToDate(bytes);
+        default:
+            return null;
+    }
+}
+
+function getFieldValue(
+    ds: DataStream,
+    msgData: MsgData,
+    fieldProperty: Property,
+    type: string
+): string | Uint8Array | number | boolean | Date | null {
+    const bytes = getFieldBytes(ds, msgData, fieldProperty);
+    if (bytes === null) return null;
+    // Embedded-message streams (000D) have no scalar decoding; expose raw bytes.
+    if (type === CONST.MSG.FIELD.DIR_TYPE.INNER_MSG) return bytes;
+    return decodeFieldValue(bytes, type);
+}
+
+/** Lenient variant used while building message fields: corrupt streams decode as null. */
+function safeGetFieldValue(
+    ds: DataStream,
+    msgData: MsgData,
+    fieldProperty: Property,
+    type: string
+): string | Uint8Array | number | boolean | Date | null {
+    try {
+        return getFieldValue(ds, msgData, fieldProperty, type);
+    } catch (err) {
+        if (err instanceof RangeError) return null;
+        throw err;
+    }
 }
 
 export default class MsgReader {
-    ds: DataStream;
-    fileData: MsgData;
+    private ds: DataStream;
+    private fileData: MsgData | null = null;
 
-    constructor(arrayBuffer: ArrayBuffer | DataView) {
-        this.ds = new DataStream(arrayBuffer, 0, DataStream.LITTLE_ENDIAN);
+    constructor(input: MsgBuffer) {
+        this.ds = new DataStream(input, 0, DataStream.LITTLE_ENDIAN);
+        if (this.ds.byteLength < 8) {
+            throw new InvalidMsgFileError('Input is too small to be an Outlook .msg file.');
+        }
     }
 
-    getFileData(): FieldsData {
+    /** Non-throwing check: true when `input` starts with the OLE compound-document magic. */
+    static isMsgFile(input: MsgBuffer): boolean {
+        try {
+            const ds = new DataStream(input, 0, DataStream.LITTLE_ENDIAN);
+            if (ds.byteLength < 8) return false;
+            return isMSGFile(ds);
+        } catch {
+            return false;
+        }
+    }
+
+    private ensureParsed(): MsgData {
         if (!isMSGFile(this.ds)) {
-            return { error: 'Unsupported file type!' };
+            throw new InvalidMsgFileError();
         }
         if (this.fileData == null) {
             this.fileData = parseMsgData(this.ds);
         }
-        return this.fileData.fieldsData;
+        return this.fileData;
     }
 
     /**
-   Reads an attachment content by key/ID
-    @return {Object} The attachment for specific attachment key
-    */
-    getAttachment(attach: number | FieldsData): { fileName: string; content: Uint8Array } {
-        var attachData = typeof attach === 'number' ? this.fileData.fieldsData.attachments[attach] : attach;
-        var fieldProperty = this.fileData.propertyData[attachData.dataId];
-        var fieldData = getFieldValue(this.ds, this.fileData, fieldProperty, getFieldType(fieldProperty));
+     * Returns message metadata, recipients and attachment descriptors.
+     * Attachment *contents* are not loaded; use getAttachment() for those.
+     * The returned object is a shallow copy — mutating it does not affect
+     * the reader — but binary payloads (compressedRtf, bodyHtml) are shared
+     * views and should be treated as read-only.
+     */
+    getFileData(): MessageData {
+        const parsed = this.ensureParsed();
+        const fields = parsed.fieldsData as MessageData;
+        return {
+            ...fields,
+            attachments: fields.attachments.map((attachment) => ({ ...attachment })),
+            recipients: fields.recipients.map((recipient) => ({ ...recipient })),
+            extraProperties: { ...fields.extraProperties },
+        };
+    }
 
-        return { fileName: attachData.fileName, content: fieldData };
+    /** Returns the parsed OLE directory entries (for advanced use). */
+    getProperties(): (Property | null)[] {
+        return (this.ensureParsed().propertyData ?? []).slice();
+    }
+
+    /**
+     * Reads an attachment's content.
+     * @param attachment attachment index, or an attachment descriptor from getFileData().
+     */
+    getAttachment(attachment: number | Attachment): AttachmentContent {
+        if (typeof attachment === 'number') {
+            return this.getAttachmentByIndex(attachment);
+        }
+        return this.getAttachmentData(attachment);
+    }
+
+    /** Reads an attachment's content by its index in `getFileData().attachments`. */
+    getAttachmentByIndex(index: number): AttachmentContent {
+        const attachments = this.ensureParsed().fieldsData?.attachments ?? [];
+        const attachment = attachments[index];
+        if (!attachment) {
+            throw new RangeError(`Attachment index ${index} is out of range (found ${attachments.length} attachment(s)).`);
+        }
+        return this.getAttachmentData(attachment);
+    }
+
+    /** Reads an attachment's content from its descriptor. */
+    getAttachmentData(attachment: Attachment): AttachmentContent {
+        if (!attachment || typeof attachment.dataId !== 'number') {
+            throw new TypeError('Invalid attachment descriptor: missing dataId.');
+        }
+        const parsed = this.ensureParsed();
+        const propertyDataRef = parsed.propertyData ?? [];
+        const fieldProperty =
+            Number.isInteger(attachment.dataId) && attachment.dataId >= 0 && attachment.dataId < propertyDataRef.length
+                ? propertyDataRef[attachment.dataId] ?? null
+                : null;
+        if (!fieldProperty || fieldProperty.type !== PropertyType.Document) {
+            throw new Error(`Attachment "${attachment.fileName ?? '?'}" points at a missing data stream.`);
+        }
+        const content = getFieldBytes(this.ds, parsed, fieldProperty) ?? new Uint8Array(0);
+
+        return {
+            fileName: attachment.fileName,
+            fileNameShort: attachment.fileNameShort,
+            extension: attachment.extension,
+            mimeType: attachment.mimeType,
+            pidContentId: attachment.pidContentId,
+            contentLength: content.length,
+            content,
+        };
+    }
+
+    /**
+     * Decompresses the PidTagRtfCompressed body to an RTF string.
+     * Returns null when the message has no compressed RTF body.
+     */
+    getRtfBody(): string | null {
+        const compressedRtf = this.ensureParsed().fieldsData?.compressedRtf;
+        if (!compressedRtf || compressedRtf.length === 0) return null;
+        return decompressRtfToString(compressedRtf);
     }
 }
