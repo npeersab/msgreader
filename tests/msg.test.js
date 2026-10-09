@@ -90,6 +90,7 @@ describe('MsgReader — test.msg fixture', () => {
         const rtf = reader.getRtfBody();
         assert.equal(typeof rtf, 'string');
         assert.ok(rtf.startsWith('{\\rtf'));
+        assert.equal(reader.getHtmlBody(), null); // test.msg has no HTML body
     });
 });
 

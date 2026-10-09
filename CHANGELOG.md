@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Embedded messages parse recursively into `attachment.embeddedMessage`
+  (depth-bounded at 10 levels); `getAttachment()` on one throws a
+  descriptive error pointing at the field.
+- `getHtmlBody()` decodes `PidTagBodyHtml` for both binary (`0102`) and
+  string (`001E`) storage (BOM → `<meta charset>` → strict-UTF-8 →
+  message codepage); `bodyHtml` is typed `Uint8Array | string`.
+- True dual ESM + CommonJS builds (`lib-esm/` with `module`/`exports` map,
+  `.js`-suffixed imports).
+- Regression fixtures and suites: 9 Apache POI samples plus an OSS-Fuzz
+  crasher (47 assertions total).
+- `001E` codepage also resolved from `__properties_version1.0` fixed
+  properties, per directory scope (fixes e.g. CP1251 messages like
+  `cyrillic_message.msg`).
+
 ## 5.0.0
 
 Major release — correctness, API, packaging and feature overhaul.

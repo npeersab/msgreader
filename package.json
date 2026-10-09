@@ -5,25 +5,26 @@
     "license": "Apache-2.0",
     "type": "commonjs",
     "main": "lib/index.js",
+    "module": "lib-esm/index.js",
     "types": "lib/index.d.ts",
     "exports": {
         ".": {
             "types": "./lib/index.d.ts",
+            "import": "./lib-esm/index.js",
             "require": "./lib/index.js",
-            "import": "./lib/index.js",
             "default": "./lib/index.js"
         },
         "./package.json": "./package.json"
     },
-    "files": ["lib", "README.md", "LICENSE", "CHANGELOG.md"],
+    "files": ["lib", "lib-esm", "README.md", "LICENSE", "CHANGELOG.md"],
     "keywords": ["msg", "outlook", "email", "ole", "cfb", "attachment", "parser", "rtf"],
     "engines": {
         "node": ">=16"
     },
     "scripts": {
-        "build": "npm run clean && tsc -p tsconfig.json",
-        "clean": "rm -rf lib",
-        "test": "npm run build && node --test tests/*.test.js",
+        "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node -e \"require('fs').writeFileSync('lib-esm/package.json', JSON.stringify({type:'module'}))\"",
+        "clean": "rm -rf lib lib-esm",
+        "test": "npm run build && node --test tests/*.test.js tests/*.test.mjs",
         "prepare": "npm run build",
         "prepublishOnly": "npm run build"
     },

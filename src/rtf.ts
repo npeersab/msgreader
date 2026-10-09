@@ -1,4 +1,4 @@
-import { crc32 } from './utils';
+import { crc32 } from './utils.js';
 
 /**
  * Compressed RTF (LZFu) decompression per MS-OXRTFCP

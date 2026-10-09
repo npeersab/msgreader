@@ -16,10 +16,10 @@
  MSG Reader
  */
 
-import { arraysEqual, codepageToEncoding, concatUint8Arrays, decodeSingleByteString, fileTimeToDate, stripTrailingNul } from './utils';
-import CONST from './const';
-import DataStream, { ByteSource } from './data-stream-reader-lite';
-import { decompressRtfToString } from './rtf';
+import { arraysEqual, codepageToEncoding, concatUint8Arrays, decodeSingleByteString, fileTimeToDate, stripTrailingNul } from './utils.js';
+import CONST from './const.js';
+import DataStream, { ByteSource } from './data-stream-reader-lite.js';
+import { decompressRtfToString } from './rtf.js';
 
 export type { ByteSource };
 
@@ -381,8 +381,8 @@ export interface MessageTextFields {
     senderSmtpAddress?: string;
     /** PidTagBody (1000), plain text. */
     body?: string;
-    /** PidTagBodyHtml (1013), raw HTML bytes when present. */
-    bodyHtml?: Uint8Array;
+    /** PidTagBodyHtml (1013): raw HTML, as bytes (0102) or string (001E). Use getHtmlBody(). */
+    bodyHtml?: Uint8Array | string;
     /** PidTagTransportMessageHeaders (007D). */
     headers?: string;
     /** PidTagRtfCompressed (1009). Use getRtfBody() to decompress. */
@@ -418,6 +418,11 @@ export interface Attachment {
     attachContentLocation?: string;
     /** PidTagAttachMethod (3705). */
     attachMethod?: number;
+    /**
+     * The embedded message for attachments that contain one
+     * (`hasInnerMsg`), parsed recursively.
+     */
+    embeddedMessage?: MessageData;
     /**
      * True when the attachment embeds another message (unsupported content).
      * @deprecated Use hasInnerMsg instead.
@@ -489,20 +494,63 @@ function fieldsData(ds: DataStream, msgData: MsgData): MessageData {
  * (3FFD). Falls back to windows-1252 when absent or unreadable.
  */
 function resolveMessageEncoding(ds: DataStream, msgData: MsgData): string {
+    const root = msgData.propertyData?.[0] ?? null;
+    return root ? resolveDirEncoding(ds, msgData, root, 'windows-1252') : 'windows-1252';
+}
+
+/**
+ * Resolves the 001E encoding for one directory scope: a `__substg1.0_3FFD0003`
+ * stream or a 3FFD entry in that scope's `__properties_version1.0`
+ * fixed-property stream (MS-OXMSG 2.4.5) wins; otherwise `inherited` applies.
+ */
+function resolveDirEncoding(ds: DataStream, msgData: MsgData, dirProperty: Property, inherited: string): string {
     try {
         const props = msgData.propertyData ?? [];
-        const codepageProp =
-            props.find(
-                (p) => p !== null && p.type === PropertyType.Document && p.name.toLowerCase() === '__substg1.0_3ffd0003'
-            ) ?? null;
-        if (!codepageProp) return 'windows-1252';
-        const bytes = getFieldBytes(ds, msgData, codepageProp);
-        if (!bytes || bytes.length < 4) return 'windows-1252';
-        const codepage = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(0, true);
-        return codepageToEncoding(codepage);
+        const childAt = (name: string): Property | null => {
+            for (const index of dirProperty.children ?? []) {
+                const child = index >= 0 && index < props.length ? props[index] ?? null : null;
+                if (child && child.type === PropertyType.Document && child.name.toLowerCase() === name) {
+                    return child;
+                }
+            }
+            return null;
+        };
+        const streamProp = childAt('__substg1.0_3ffd0003');
+        if (streamProp) {
+            const bytes = getFieldBytes(ds, msgData, streamProp);
+            if (bytes && bytes.length >= 4) {
+                return codepageToEncoding(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(0, true));
+            }
+        }
+        const fixedProp = childAt('__properties_version1.0');
+        if (fixedProp) {
+            const codepage = findFixedCodepage(ds, msgData, fixedProp);
+            if (codepage !== null) return codepageToEncoding(codepage);
+        }
     } catch {
-        return 'windows-1252';
+        // corrupt scope metadata — fall through to inherited encoding
     }
+    return inherited;
+}
+
+/**
+ * Scans a `__properties_version1.0` fixed-property stream for a 3FFD
+ * (PidTagMessageCodepage) entry. Returns the codepage number or null.
+ */
+function findFixedCodepage(ds: DataStream, msgData: MsgData, propertiesProp: Property): number | null {
+    const bytes = getFieldBytes(ds, msgData, propertiesProp);
+    if (!bytes || bytes.length < 32 + 16) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const entryCount = Math.floor((bytes.length - 32) / 16);
+    for (let i = 0; i < entryCount; i++) {
+        const offset = 32 + i * 16;
+        const propType = view.getUint16(offset, true);
+        const propId = view.getUint16(offset + 2, true);
+        if (propId === 0x3ffd && propType === 0x0003) {
+            return view.getInt32(offset + 8, true);
+        }
+    }
+    return null;
 }
 
 function fieldsDataDir(
@@ -510,7 +558,8 @@ function fieldsDataDir(
     msgData: MsgData,
     dirProperty: Property,
     fields: MessageData | Attachment | Recipient,
-    ansiEncoding: string
+    ansiEncoding: string,
+    depth = 0
 ): void {
     if (dirProperty && dirProperty.children && dirProperty.children.length > 0) {
         const propertyDataRef = msgData.propertyData;
@@ -521,7 +570,7 @@ function fieldsDataDir(
             if (childProperty == null) continue;
 
             if (childProperty.type === PropertyType.Directory) {
-                fieldsDataDirInner(ds, msgData, childProperty, fields, ansiEncoding);
+                fieldsDataDirInner(ds, msgData, childProperty, fields, ansiEncoding, depth);
             } else if (
                 childProperty.type === PropertyType.Document &&
                 childProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.DOCUMENT) === 0
@@ -532,34 +581,44 @@ function fieldsDataDir(
     }
 }
 
+/** Max nesting level for embedded messages (guards malicious files). */
+const MAX_EMBEDDED_DEPTH = 10;
+
 function fieldsDataDirInner(
     ds: DataStream,
     msgData: MsgData,
     dirProperty: Property,
     fields: MessageData | Attachment | Recipient,
-    ansiEncoding: string
+    ansiEncoding: string,
+    depth = 0
 ): void {
     if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.ATTACHMENT) === 0) {
         // attachment
         const attachmentField: Attachment = { dataId: -1, contentLength: 0, extraProperties: {} };
         (fields as MessageData).attachments.push(attachmentField);
-        fieldsDataDir(ds, msgData, dirProperty, attachmentField, ansiEncoding);
+        fieldsDataDir(ds, msgData, dirProperty, attachmentField, ansiEncoding, depth);
     } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.RECIPIENT) === 0) {
         // recipient
         const recipientField: Recipient = { extraProperties: {} };
         (fields as MessageData).recipients.push(recipientField);
-        fieldsDataDir(ds, msgData, dirProperty, recipientField, ansiEncoding);
+        fieldsDataDir(ds, msgData, dirProperty, recipientField, ansiEncoding, depth);
     } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.NAMEID) === 0) {
         // unknown, skip
     } else {
         // other dir
         const childFieldType = getFieldType(dirProperty);
         if (childFieldType !== CONST.MSG.FIELD.DIR_TYPE.INNER_MSG) {
-            fieldsDataDir(ds, msgData, dirProperty, fields, ansiEncoding);
+            fieldsDataDir(ds, msgData, dirProperty, fields, ansiEncoding, depth);
         } else {
-            // MSG as attachment currently isn't supported
-            (fields as Attachment).innerMsgContent = true;
-            (fields as Attachment).hasInnerMsg = true;
+            // embedded message attachment: parse recursively (depth-bounded)
+            const attachmentField = fields as Attachment;
+            attachmentField.innerMsgContent = true;
+            attachmentField.hasInnerMsg = true;
+            if (depth < MAX_EMBEDDED_DEPTH) {
+                const embedded: MessageData = { attachments: [], recipients: [], extraProperties: {} };
+                fieldsDataDir(ds, msgData, dirProperty, embedded, resolveDirEncoding(ds, msgData, dirProperty, ansiEncoding), depth + 1);
+                attachmentField.embeddedMessage = embedded;
+            }
         }
     }
 }
@@ -789,6 +848,35 @@ function getFieldValue(
     return decodeFieldValue(bytes, type, ansiEncoding);
 }
 
+const HTML_HEAD_SCAN_LENGTH = 2048;
+
+/**
+ * Decodes a binary HTML body: BOM first, then `<meta charset>`, then a
+ * strict UTF-8 attempt, finally the message (codepage) encoding.
+ */
+function decodeHtmlBytes(bytes: Uint8Array, fallbackEncoding: string): string {
+    if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+        return new TextDecoder('utf-16le').decode(bytes);
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        return new TextDecoder('utf-8').decode(bytes.slice(3));
+    }
+    const head = new TextDecoder('windows-1252').decode(bytes.slice(0, Math.min(bytes.length, HTML_HEAD_SCAN_LENGTH)));
+    const meta = /charset\s*=\s*\\?["']?([^"'\\\s;>]+)/i.exec(head);
+    if (meta) {
+        try {
+            return new TextDecoder((meta[1] as string).toLowerCase()).decode(bytes);
+        } catch {
+            // unknown charset label — fall through to probing
+        }
+    }
+    try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+        return decodeSingleByteString(bytes, fallbackEncoding);
+    }
+}
+
 /** Lenient variant used while building message fields: corrupt streams decode as null. */
 function safeGetFieldValue(
     ds: DataStream,
@@ -803,6 +891,22 @@ function safeGetFieldValue(
         if (err instanceof RangeError) return null;
         throw err;
     }
+}
+
+/** Defensive copy of parsed message data (embedded messages included). */
+function cloneMessage(fields: MessageData): MessageData {
+    return {
+        ...fields,
+        attachments: fields.attachments.map((attachment) => {
+            const copy: Attachment = { ...attachment };
+            if (attachment.embeddedMessage) {
+                copy.embeddedMessage = cloneMessage(attachment.embeddedMessage);
+            }
+            return copy;
+        }),
+        recipients: fields.recipients.map((recipient) => ({ ...recipient })),
+        extraProperties: { ...fields.extraProperties },
+    };
 }
 
 export default class MsgReader {
@@ -840,19 +944,13 @@ export default class MsgReader {
     /**
      * Returns message metadata, recipients and attachment descriptors.
      * Attachment *contents* are not loaded; use getAttachment() for those.
-     * The returned object is a shallow copy — mutating it does not affect
+     * The returned object is a defensive copy — mutating it does not affect
      * the reader — but binary payloads (compressedRtf, bodyHtml) are shared
      * views and should be treated as read-only.
      */
     getFileData(): MessageData {
         const parsed = this.ensureParsed();
-        const fields = parsed.fieldsData as MessageData;
-        return {
-            ...fields,
-            attachments: fields.attachments.map((attachment) => ({ ...attachment })),
-            recipients: fields.recipients.map((recipient) => ({ ...recipient })),
-            extraProperties: { ...fields.extraProperties },
-        };
+        return cloneMessage(parsed.fieldsData as MessageData);
     }
 
     /** Returns the parsed OLE directory entries (for advanced use). */
@@ -895,7 +993,7 @@ export default class MsgReader {
         if (!fieldProperty || fieldProperty.type !== PropertyType.Document) {
             const name = attachment.fileName ?? attachment.fileNameShort ?? 'unknown';
             if (attachment.hasInnerMsg) {
-                throw new Error(`Attachment "${name}" is an embedded message, which is not supported.`);
+                throw new Error(`Attachment "${name}" is an embedded message; read attachment.embeddedMessage instead.`);
             }
             throw new Error(`Attachment "${name}" points at a missing data stream.`);
         }
@@ -920,5 +1018,19 @@ export default class MsgReader {
         const compressedRtf = this.ensureParsed().fieldsData?.compressedRtf;
         if (!compressedRtf || compressedRtf.length === 0) return null;
         return decompressRtfToString(compressedRtf);
+    }
+
+    /**
+     * Returns the PidTagBodyHtml body as a string, or null when absent.
+     * Binary payloads are decoded via BOM / `<meta charset>` / strict-UTF-8
+     * probing, falling back to the message codepage (windows-1252 default).
+     */
+    getHtmlBody(): string | null {
+        const parsed = this.ensureParsed();
+        const bodyHtml = parsed.fieldsData?.bodyHtml;
+        if (bodyHtml === undefined || bodyHtml === null) return null;
+        if (typeof bodyHtml === 'string') return bodyHtml;
+        if (bodyHtml.length === 0) return '';
+        return decodeHtmlBytes(bodyHtml, resolveMessageEncoding(this.ds, parsed));
     }
 }

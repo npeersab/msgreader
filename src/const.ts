@@ -1,4 +1,4 @@
-import { uInt2int } from './utils';
+import { uInt2int } from './utils.js';
 
 /**
  * Maps a 4-hex-digit property class (e.g. `0037`) to a friendly field name.

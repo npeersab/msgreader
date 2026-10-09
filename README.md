@@ -12,8 +12,9 @@ Original project: https://github.com/ykarpovich/msg.reader
 npm install @npeersab/msgreader
 ```
 
-Requires Node.js >= 16. The package ships CommonJS (`lib/`) with TypeScript
-declarations; it works from both `require()` and `import`.
+Requires Node.js >= 16. The package ships dual builds — CommonJS (`lib/`)
+and true ESM (`lib-esm/`) — with TypeScript declarations; it works from both
+`require()` and `import`.
 
 ## How to use
 
@@ -99,6 +100,7 @@ Parses the file (once — results are cached) and returns message metadata:
 | `senderName` / `senderEmail` / `senderSmtpAddress` | `0C1A`/`0C1F`/`0C1E` | |
 | `displayTo` / `displayCc` / `displayBcc` | `0E04`/`0E03`/`0E02` | |
 | `body` | `1000` | plain text |
+| `bodyHtml` | `1013` | raw HTML (`Uint8Array` or `string`); use `getHtmlBody()` |
 | `bodyHtml` | `1013` | raw HTML bytes, when present |
 | `headers` | `007D` | transport headers |
 | `compressedRtf` | `1009` | raw LZFu bytes; use `getRtfBody()` |
@@ -110,8 +112,8 @@ Parses the file (once — results are cached) and returns message metadata:
 
 Attachment descriptors carry `dataId`, `contentLength`, `fileName`,
 `fileNameShort`, `extension`, `mimeType`, `pidContentId`,
-`attachContentLocation`, `attachMethod`, plus `hasInnerMsg` when the
-attachment embeds another message.
+`attachContentLocation`, `attachMethod`, plus `hasInnerMsg` and the
+recursively parsed `embeddedMessage` when the attachment is itself a message.
 
 The returned object is a shallow copy; binary payloads are shared read-only
 views.
@@ -123,6 +125,8 @@ mimeType, pidContentId, contentLength, content }`). Accepts an index into
 `getFileData().attachments` or a descriptor object. Aliases:
 `getAttachmentByIndex(i)`, `getAttachmentData(descriptor)`. Throws
 `RangeError` for unknown indexes and `TypeError` for invalid descriptors.
+Embedded-message attachments have no byte content — `getAttachment()` throws
+a descriptive error for them; read `descriptor.embeddedMessage` instead.
 Parsing happens automatically — no need to call `getFileData()` first.
 
 ### `getRtfBody(): string | null`
@@ -130,6 +134,12 @@ Parsing happens automatically — no need to call `getFileData()` first.
 Decompresses the `PidTagRtfCompressed` body (MS-OXRTFCP LZFu) and returns the
 RTF markup string, or `null` when absent. The low-level helpers
 `decompressRtf(bytes)` / `decompressRtfToString(bytes)` are also exported.
+
+### `getHtmlBody(): string | null`
+
+Returns the `PidTagBodyHtml` body as a string, or `null` when absent.
+Binary payloads decode via BOM → `<meta charset>` → strict-UTF-8 probing,
+falling back to the message codepage (windows-1252 default).
 
 ### `getProperties()`
 
@@ -153,12 +163,13 @@ try {
 
 ## Limitations
 
-- Attachments that embed another message (`.msg` inside `.msg`) are reported
-  via `hasInnerMsg` but their content is not parsed recursively —
-  `getAttachment()` throws a descriptive error for them.
-- Single-byte (`001E`) strings decode with `PidTagMessageCodepage` when the
-  file carries one, otherwise windows-1252. Files without a codepage tag
-  whose text is really e.g. Big5/CP1251 will show mojibake (same as 4.x).
+- Embedded messages recurse up to 10 levels deep; deeper nesting keeps the
+  `hasInnerMsg` flag without further parsing.
+- Single-byte (`001E`) strings decode with `PidTagMessageCodepage`, read from
+  the `3FFD` stream or the scope's `__properties_version1.0` fixed properties
+  (embedded messages resolve their own scope), otherwise windows-1252.
+  Files with no codepage signal anywhere (e.g. Big5 text without a tag) fall
+  back to windows-1252 and will show mojibake.
 - HTML bodies are exposed as raw bytes (`bodyHtml`) when Outlook stored them;
   there is no RTF→HTML conversion — use `getRtfBody()` for the RTF markup.
 - `getFileData()` decodes corrupt *streams* as missing fields (lenient), but
