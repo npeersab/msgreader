@@ -103,6 +103,7 @@ Parses the file (once — results are cached) and returns message metadata:
 | `headers` | `007D` | transport headers |
 | `compressedRtf` | `1009` | raw LZFu bytes; use `getRtfBody()` |
 | `internetMessageId` | `1035` | |
+| `messageCodepage` | `3FFD` | Windows codepage used to decode `001E` strings |
 | `attachments` | | descriptors (no content loaded) |
 | `recipients` | | `{ name, email, addressType, smtpAddress, ... }` |
 | `extraProperties` | | decoded scalar values for tags without a friendly name, keyed by 4-hex-digit class (e.g. `extraProperties['0040']`) |
@@ -153,7 +154,11 @@ try {
 ## Limitations
 
 - Attachments that embed another message (`.msg` inside `.msg`) are reported
-  via `hasInnerMsg` but their content is not parsed recursively.
+  via `hasInnerMsg` but their content is not parsed recursively —
+  `getAttachment()` throws a descriptive error for them.
+- Single-byte (`001E`) strings decode with `PidTagMessageCodepage` when the
+  file carries one, otherwise windows-1252. Files without a codepage tag
+  whose text is really e.g. Big5/CP1251 will show mojibake (same as 4.x).
 - HTML bodies are exposed as raw bytes (`bodyHtml`) when Outlook stored them;
   there is no RTF→HTML conversion — use `getRtfBody()` for the RTF markup.
 - `getFileData()` decodes corrupt *streams* as missing fields (lenient), but

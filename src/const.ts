@@ -21,6 +21,7 @@ const NAME_MAPPING: Record<string, string> = {
     '1009': 'compressedRtf',
     '1013': 'bodyHtml',
     '1035': 'internetMessageId',
+    '3ffd': 'messageCodepage',
     // attachment specific
     '3703': 'extension',
     '3704': 'fileNameShort',

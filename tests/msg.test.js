@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const { default: MsgReader, InvalidMsgFileError } = require('../lib/index.js');
+const { default: MsgReader, InvalidMsgFileError, codepageToEncoding } = require('../lib/index.js');
 
 const FIXTURE = fs.readFileSync(path.join(__dirname, '..', 'data', 'test.msg'));
 // md5 of the attached JPEG, verified against the pre-rewrite (4.x) parser.
@@ -152,6 +152,23 @@ describe('MsgReader — error handling', () => {
         // valid OLE magic but zeroed header
         Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(garbage, 0);
         assert.throws(() => new MsgReader(garbage).getFileData(), Error);
+    });
+});
+
+describe('codepageToEncoding', () => {
+    it('maps Windows codepages to TextDecoder labels', () => {
+        assert.equal(codepageToEncoding(1252), 'windows-1252');
+        assert.equal(codepageToEncoding(1251), 'windows-1251');
+        assert.equal(codepageToEncoding(950), 'big5');
+        assert.equal(codepageToEncoding(936), 'gbk');
+        assert.equal(codepageToEncoding(932), 'shift_jis');
+        assert.equal(codepageToEncoding(949), 'euc-kr');
+        assert.equal(codepageToEncoding(65001), 'utf-8');
+    });
+
+    it('falls back to windows-1252 for unknown codepages', () => {
+        assert.equal(codepageToEncoding(0), 'windows-1252');
+        assert.equal(codepageToEncoding(999999), 'windows-1252');
     });
 });
 

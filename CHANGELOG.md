@@ -50,7 +50,10 @@ Major release — correctness, API, packaging and feature overhaul.
 - `decompressRtf()` / `decompressRtfToString()` (MS-OXRTFCP LZFu, CRC-checked)
   plus `MsgReader.getRtfBody()`.
 - New APIs: `getAttachmentByIndex`, `getAttachmentData`, `getProperties`,
-  `MsgReader.isMsgFile`.
+  `MsgReader.isMsgFile`, `codepageToEncoding`.
+- `001E` strings decode with `PidTagMessageCodepage` when present
+  (windows-1252 fallback); embedded-message attachments throw a descriptive
+  error from `getAttachment()`.
 - Constructor accepts `Buffer`, `Uint8Array`, `ArrayBuffer`, `DataView` and
   generic buffer views; `getAttachment()` auto-parses (no need to call
   `getFileData()` first); `getFileData()` returns a defensive copy.

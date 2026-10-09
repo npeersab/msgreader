@@ -86,6 +86,57 @@ export function crc32(data: Uint8Array, options?: Crc32Options): number {
 const FILETIME_EPOCH_DIFF_MS = 11644473600000; // ms between 1601-01-01 and 1970-01-01
 
 /**
+ * Maps a Windows codepage number (PidTagMessageCodepage, e.g. 1252) to a
+ * WHATWG encoding label suitable for TextDecoder. Unknown codepages fall
+ * back to windows-1252, matching historical behavior for 001E strings.
+ */
+export function codepageToEncoding(codepage: number): string {
+    switch (codepage) {
+        case 874:
+            return 'windows-874';
+        case 932:
+            return 'shift_jis';
+        case 936:
+            return 'gbk';
+        case 949:
+            return 'euc-kr';
+        case 950:
+            return 'big5';
+        case 1250:
+            return 'windows-1250';
+        case 1251:
+            return 'windows-1251';
+        case 1252:
+            return 'windows-1252';
+        case 1253:
+            return 'windows-1253';
+        case 1254:
+            return 'windows-1254';
+        case 1255:
+            return 'windows-1255';
+        case 1256:
+            return 'windows-1256';
+        case 1257:
+            return 'windows-1257';
+        case 1258:
+            return 'windows-1258';
+        case 65001:
+            return 'utf-8';
+        default:
+            return 'windows-1252';
+    }
+}
+
+/** Decodes single-byte text with the given encoding label, falling back to windows-1252. */
+export function decodeSingleByteString(bytes: Uint8Array, encoding: string): string {
+    try {
+        return new TextDecoder(encoding).decode(bytes);
+    } catch {
+        return new TextDecoder('windows-1252').decode(bytes);
+    }
+}
+
+/**
  * Converts an 8-byte Windows FILETIME (100ns intervals since 1601-01-01,
  * little-endian) to a Date. Returns null for a zero FILETIME.
  */
