@@ -1,6 +1,6 @@
 {
     "name": "@npeersab/msgreader",
-    "version": "5.0.0",
+    "version": "5.1.0",
     "description": "Outlook .msg file reader: parse MSG metadata, recipients, RTF body and attachments in Node.js and browsers",
     "license": "Apache-2.0",
     "type": "commonjs",
@@ -16,8 +16,23 @@
         },
         "./package.json": "./package.json"
     },
-    "files": ["lib", "lib-esm", "README.md", "LICENSE", "CHANGELOG.md"],
-    "keywords": ["msg", "outlook", "email", "ole", "cfb", "attachment", "parser", "rtf"],
+    "files": [
+        "lib",
+        "lib-esm",
+        "README.md",
+        "LICENSE",
+        "CHANGELOG.md"
+    ],
+    "keywords": [
+        "msg",
+        "outlook",
+        "email",
+        "ole",
+        "cfb",
+        "attachment",
+        "parser",
+        "rtf"
+    ],
     "engines": {
         "node": ">=16"
     },
